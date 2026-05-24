@@ -50,3 +50,24 @@ export async function createBooking(roomId: string, professorName: string, start
     return { success: false, error: error.message };
   }
 }
+
+
+export async function getBookings(roomId: string) {
+  try {
+    const bookingsRef = collection(db, "bookings");
+    const q = query(bookingsRef, where("roomId", "==", roomId));
+    
+    const snapshot = await getDocs(q);
+    const results: any[] = [];
+    
+    snapshot.forEach((doc) => {
+      results.push({ id: doc.id, ...doc.data() });
+    });
+    
+    return { success: true, data: results };
+  }  catch (error: any) {
+    console.error("Error fetching bookings:", error);
+    // Add "data: []" to this return statement!
+    return { success: false, error: error.message, data: [] }; 
+  }
+}

@@ -11,7 +11,7 @@
 !.yarn/versions
 
 .env.local
-
+gemini key.json
 # testing
 /coverage
 

@@ -2,7 +2,7 @@
 
 import { VertexAI, FunctionDeclaration, FunctionDeclarationSchemaType } from "@google-cloud/vertexai";
 import { db } from "./lib/firebase"; 
-import { collection, addDoc, getDocs, query, where } from "firebase/firestore";
+import { collection, addDoc, getDocs, query, where, deleteDoc, doc, orderBy, limit } from "firebase/firestore";
 import { revalidatePath } from "next/cache"; 
 
 // ==========================================
@@ -33,22 +33,19 @@ const ROOM_DIRECTORY = [
 const VALID_ROOM_NAMES = ROOM_DIRECTORY.map(r => r.id).join(", ");
 
 // ==========================================
-// DATABASE FUNCTIONS 
+// DATABASE FUNCTIONS
 // ==========================================
 export async function createBooking(roomId: string, professorName: string, startIso: string, endIso: string) {
   try {
     const bookingsRef = collection(db, "bookings");
     const q = query(bookingsRef, where("roomId", "==", roomId), where("startIso", "==", startIso));
     const snapshot = await getDocs(q);
-    
     if (!snapshot.empty) return { success: false, error: "Slot already taken." };
-
-    const docRef = await addDoc(bookingsRef, { roomId, professorName, startIso, endIso, createdAt: new Date().toISOString() });
+    
+    await addDoc(bookingsRef, { roomId, professorName, startIso, endIso, createdAt: new Date().toISOString() });
     revalidatePath("/");
-    return { success: true, bookingId: docRef.id };
-  } catch (error: any) {
-    return { success: false, error: error.message };
-  }
+    return { success: true };
+  } catch (error: any) { return { success: false, error: error.message }; }
 }
 
 export async function getBookings(roomId: string) {
@@ -58,61 +55,89 @@ export async function getBookings(roomId: string) {
     const snapshot = await getDocs(q);
     const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data(), startTime: doc.data().startIso }));
     return { success: true, data };
-  } catch (error: any) {
-    return { success: false, error: error.message };
-  }
+  } catch (error: any) { return { success: false, error: error.message }; }
+}
+
+export async function deleteBookingById(bookingId: string) {
+  try {
+    await deleteDoc(doc(db, "bookings", bookingId));
+    revalidatePath("/");
+    return { success: true };
+  } catch (error: any) { return { success: false, error: error.message }; }
+}
+
+export async function deleteBookingByDetails(roomId: string | null, startIso: string | null, professorName: string) {
+  try {
+    const bookingsRef = collection(db, "bookings");
+    
+    if (!roomId || !startIso) {
+      const q = query(bookingsRef, where("professorName", "==", professorName), orderBy("createdAt", "desc"), limit(1));
+      const snapshot = await getDocs(q);
+      if (snapshot.empty) return { success: false, error: "No active bookings registered to your name." };
+      
+      const data = snapshot.docs[0].data();
+      await deleteDoc(snapshot.docs[0].ref);
+      revalidatePath("/");
+      return { success: true, targetRoom: data.roomId };
+    }
+
+    const q = query(bookingsRef, where("roomId", "==", roomId), where("startIso", "==", startIso), where("professorName", "==", professorName));
+    const snapshot = await getDocs(q);
+    if (snapshot.empty) return { success: false, error: "No matching booking found under your identity parameters." };
+    
+    await deleteDoc(snapshot.docs[0].ref);
+    revalidatePath("/");
+    return { success: true, targetRoom: roomId };
+  } catch (error: any) { return { success: false, error: error.message }; }
 }
 
 // ==========================================
-// VERTEX AI SMART AGENT (V3)
+// VERTEX AI SMART AGENT
 // ==========================================
-export async function getAiResponse(chatHistory: { role: string, text: string }[], roomContext: string) {
+export async function getAiResponse(chatHistory: { role: string, text: string }[], roomContext: string, currentUser: string) {
   try {
     const vertexAI = new VertexAI({ project: process.env.GOOGLE_CLOUD_PROJECT as string, location: "us-central1" });
 
-    // EVAL 14 & FREE SLOTS: Upgrade Discovery Tool with Intention Tracking
     const checkAvailabilityTool: FunctionDeclaration = {
       name: "checkAvailability",
-      description: "Searches directory to COUNT rooms, CHECK free slots, or LIST options. DOES NOT BOOK.",
+      description: "Searches directory data filters.",
       parameters: {
         type: FunctionDeclarationSchemaType.OBJECT,
         properties: {
-          intent: { type: FunctionDeclarationSchemaType.STRING, description: "Must be 'count' (how many total), 'slots' (how many free slots), or 'search' (finding a room to book)" },
-          checkDate: { type: FunctionDeclarationSchemaType.STRING, description: "Specific date to check for free slots (YYYY-MM-DD) (optional)" },
-          startIso: { type: FunctionDeclarationSchemaType.STRING, description: "Specific start time (optional)" },
-          roomId: { type: FunctionDeclarationSchemaType.STRING, description: "Specific room ID (optional)" },
-          minCapacity: { type: FunctionDeclarationSchemaType.INTEGER, description: "Minimum capacity needed (optional)" },
-          needsAc: { type: FunctionDeclarationSchemaType.BOOLEAN, description: "Must have AC? (optional)" },
-          minProjectors: { type: FunctionDeclarationSchemaType.INTEGER, description: "Minimum projectors (optional)" },
-          needsWhiteboard: { type: FunctionDeclarationSchemaType.BOOLEAN, description: "Must have whiteboard? (optional)" },
-          needsVideoConf: { type: FunctionDeclarationSchemaType.BOOLEAN, description: "Must have video conferencing? (optional)" },
-          needsAccessible: { type: FunctionDeclarationSchemaType.BOOLEAN, description: "Must be wheelchair accessible? (optional)" },
-          roomType: { type: FunctionDeclarationSchemaType.STRING, description: "Specific type (e.g., 'Science Lab') (optional)" },
-          floor: { type: FunctionDeclarationSchemaType.INTEGER, description: "Specific floor number (optional)" } 
+          intent: { type: FunctionDeclarationSchemaType.STRING, description: "Must be: 'count', 'slots', 'info', or 'search'" },
+          checkDate: { type: FunctionDeclarationSchemaType.STRING, description: "Date lookups (YYYY-MM-DD)" },
+          startIso: { type: FunctionDeclarationSchemaType.STRING, description: "Target start time" },
+          roomId: { type: FunctionDeclarationSchemaType.STRING, description: "Specific room ID" },
+          minCapacity: { type: FunctionDeclarationSchemaType.INTEGER, description: "Minimum capacity" },
+          needsAc: { type: FunctionDeclarationSchemaType.BOOLEAN, description: "AC filter flag" },
+          minProjectors: { type: FunctionDeclarationSchemaType.INTEGER, description: "Minimum projectors" },
+          needsWhiteboard: { type: FunctionDeclarationSchemaType.BOOLEAN, description: "Whiteboard flag" },
+          needsVideoConf: { type: FunctionDeclarationSchemaType.BOOLEAN, description: "Video infrastructure flag" },
+          needsAccessible: { type: FunctionDeclarationSchemaType.BOOLEAN, description: "Accessibility flag" },
+          roomType: { type: FunctionDeclarationSchemaType.STRING, description: "Room classification match" },
+          floor: { type: FunctionDeclarationSchemaType.INTEGER, description: "Target floor number" } 
         },
         required: ["intent"] 
       }
     };
 
-    // EVAL 18: Upgrade Book Tool to accept Arrays (Batch Processing)
     const bookRoomTool: FunctionDeclaration = {
       name: "bookRoom",
-      description: "Finalizes the transaction and BOOKS ONE OR MULTIPLE rooms.",
+      description: "Locks in multiple booking entries.",
       parameters: {
         type: FunctionDeclarationSchemaType.OBJECT,
         properties: {
           bookings: {
             type: FunctionDeclarationSchemaType.ARRAY,
-            description: "List of rooms to book. Pass multiple items if user asks for bulk booking.",
+            description: "List of rooms to book.",
             items: {
               type: FunctionDeclarationSchemaType.OBJECT,
               properties: {
                 roomId: { type: FunctionDeclarationSchemaType.STRING, description: "EXACT ID of room" },
-                professorName: { type: FunctionDeclarationSchemaType.STRING, description: "Professor's name" },
                 startIso: { type: FunctionDeclarationSchemaType.STRING, description: "Start time (YYYY-MM-DDTHH:MM:00.000Z)" },
-                endIso: { type: FunctionDeclarationSchemaType.STRING, description: "End time (one hour after start)" }
+                endIso: { type: FunctionDeclarationSchemaType.STRING, description: "End time" }
               },
-              required: ["roomId", "professorName", "startIso", "endIso"]
+              required: ["roomId", "startIso", "endIso"]
             }
           }
         },
@@ -120,23 +145,49 @@ export async function getAiResponse(chatHistory: { role: string, text: string }[
       }
     };
 
-    // EVAL 6: Complex Time Anchor (The Weekly Calendar Map)
+    // UPGRADED: Changed schema parameters to support Arrays (Batch Cancellation)
+    const cancelBookingTool: FunctionDeclaration = {
+      name: "cancelBooking",
+      description: "Cancels or deletes one or more active booking slots.",
+      parameters: {
+        type: FunctionDeclarationSchemaType.OBJECT,
+        properties: {
+          cancellations: {
+            type: FunctionDeclarationSchemaType.ARRAY,
+            description: "List of room bookings to remove. Leave array empty if user asks to cancel 'last booking' contextually.",
+            items: {
+              type: FunctionDeclarationSchemaType.OBJECT,
+              properties: {
+                roomId: { type: FunctionDeclarationSchemaType.STRING, description: "The EXACT system ID of the room" },
+                startIso: { type: FunctionDeclarationSchemaType.STRING, description: "The exact starting ISO string" }
+              },
+              required: ["roomId", "startIso"]
+            }
+          }
+        },
+        required: ["cancellations"] 
+      }
+    };
+
     const temporalAnchor = `
       Today is Monday, May 25, 2026. 
       Calendar Mapping: Mon=May 25, Tue=May 26, Wed=May 27, Thu=May 28, Fri=May 29, Sat=May 30.
-      All bookings happen on the hour between 09:00 AM and 05:00 PM (9 total slots per day).
+      Hours: 09:00 AM to 05:00 PM.
     `;
 
     const model = vertexAI.getGenerativeModel({
       model: "gemini-2.5-flash",
-      tools: [{ functionDeclarations: [checkAvailabilityTool, bookRoomTool] }], 
+      tools: [{ functionDeclarations: [checkAvailabilityTool, bookRoomTool, cancelBookingTool] }], 
       systemInstruction: {
         parts: [{ 
-            text: `You are an elite university room booking agent. STRICT RULES:
-                   0. TIME MATTERS: ${temporalAnchor} Calculate exact ISO strings using this mapping.
-                   1. DISCOVERY: If asking "how many rooms", use checkAvailability with intent='count'. If asking "how many slots are free", use intent='slots' and pass the checkDate (YYYY-MM-DD). Otherwise use intent='search'.
-                   2. BATCH BOOKING: If user wants multiple rooms (e.g. "Book Study-1A and 1B"), put BOTH in the 'bookings' array in the bookRoom tool.
-                   3. AUTO-CORRECT: Fuzzy match to valid IDs: ${VALID_ROOM_NAMES}.` 
+            text: `You are an elite university room booking agent talking directly to ${currentUser}.
+                   
+                   CRITICAL RULES:
+                   0. TIME MATH: ${temporalAnchor} Calculate exact ISO strings using this mapping.
+                   1. BATCH PROCESSING: If the user requests multiple cancellations (e.g., "Cancel my 2pm and 3pm blocks"), load ALL of them simultaneously into the 'cancellations' array in the cancelBooking tool.
+                   2. CONTEXTUAL CANCEL: If the user says "delete my last booking" without room context, supply a single object inside the 'cancellations' array with all properties left entirely blank.
+                   
+                   VALID SYSTEM DESIGNATIONS: ${VALID_ROOM_NAMES}` 
         }]
       }
     });
@@ -150,108 +201,113 @@ export async function getAiResponse(chatHistory: { role: string, text: string }[
     const response = result.response;
     const call = response.candidates?.[0]?.content?.parts?.find(part => part.functionCall)?.functionCall;
 
-    // ==========================================
-    // LOGIC SWITCHBOARD
-    // ==========================================
     if (call) {
       if (call.name === "checkAvailability") {
-        const { 
-          intent, checkDate = null, startIso = null, roomId = null, minCapacity = 0, needsAc = false, 
-          minProjectors = 0, needsWhiteboard = false, needsVideoConf = false, needsAccessible = false, 
-          roomType = null, floor = null
-        } = call.args as any;
+        const { intent, checkDate = null, startIso = null, roomId = null, minCapacity = 0, needsAc = false, minProjectors = 0, needsWhiteboard = false, needsVideoConf = false, needsAccessible = false, roomType = null, floor = null } = call.args as any;
 
-        // Same Scoring Engine as before...
-        const scoredRooms = ROOM_DIRECTORY.map(room => {
-          let score = 100;
-          if (roomId) {
-            if (room.id.toLowerCase() === roomId.toLowerCase()) score += 200; else score -= 150; 
-          }
-          if (needsAc && !room.hasAc) score -= 40;
-          if (needsVideoConf && !room.hasVideoConf) score -= 40;
-          if (needsWhiteboard && !room.hasWhiteboard) score -= 40;
-          if (needsAccessible && !room.isAccessible) score -= 80; 
-          if (roomType && !room.roomType.toLowerCase().includes(roomType.toLowerCase())) score -= 40;
-          if (floor && room.floor !== floor) score -= 40;
-          if (minProjectors > room.projectors) score -= 20;
-          if (minCapacity > 0) {
-            if (room.capacity < minCapacity) score -= (minCapacity - room.capacity) * 2; 
-            else score -= (room.capacity - minCapacity) * 0.1; 
-          }
-          return { ...room, score };
+        const filteredRooms = ROOM_DIRECTORY.filter(room => {
+          if (roomId && room.id.toLowerCase() !== roomId.toLowerCase()) return false;
+          if (floor !== null && floor !== undefined && room.floor !== floor) return false;
+          if (needsAc && !room.hasAc) return false;
+          if (needsVideoConf && !room.hasVideoConf) return false;
+          if (needsWhiteboard && !room.hasWhiteboard) return false;
+          if (needsAccessible && !room.isAccessible) return false;
+          if (roomType && !room.roomType.toLowerCase().includes(roomType.toLowerCase())) return false;
+          if (minProjectors > room.projectors) return false;
+          if (minCapacity > 0 && room.capacity < minCapacity) return false;
+          return true;
         });
 
-        const topMatches = scoredRooms.sort((a, b) => b.score - a.score).filter(room => room.score > 0).slice(0, 3);
-
-        if (topMatches.length === 0) return { success: true, text: "I couldn't find anything that matches that criteria." };
-
-        // EVAL 14 FIX: Pure Aggregation
-        if (intent === "count") {
-          return { success: true, text: `We currently have ${topMatches.length} rooms in our facility that match your specific requirements.` };
+        if (intent === "info") {
+          if (filteredRooms.length === 0) return { success: true, text: "No matching configurations found." };
+          const infoLines = filteredRooms.map(r => `• **${r.id}**: ${r.roomType} (Floor ${r.floor}, Capacity: ${r.capacity}, ${r.hasAc ? "AC" : "No AC"})`);
+          return { success: true, text: `Here are the specifications:\n\n${infoLines.join("\n")}` };
         }
 
-        // NEW FREE SLOTS FIX: Daily Math
+        if (intent === "count") return { success: true, text: `There are currently **${filteredRooms.length}** rooms matching that criteria.` };
+
         if (intent === "slots" && checkDate) {
            let slotReport = [];
            const bookingsRef = collection(db, "bookings");
-           
-           for (const room of topMatches) {
+           const standardHours = ["09:00 AM", "10:00 AM", "11:00 AM", "12:00 PM", "01:00 PM", "02:00 PM", "03:00 PM", "04:00 PM", "05:00 PM"];
+
+           for (const room of filteredRooms.slice(0, 5)) {
                const q = query(bookingsRef, where("roomId", "==", room.id));
                const snapshot = await getDocs(q);
-               // Filter existing bookings by the target date to find how many slots are taken
-               const bookedCount = snapshot.docs.filter(d => d.data().startIso.includes(checkDate)).length;
-               // Standard day has 9 slots (9 AM to 5 PM)
-               const freeSlots = 9 - bookedCount;
-               slotReport.push(`**${room.id}**: ${freeSlots} free slots`);
+               const bookedHours = snapshot.docs
+                 .map(d => d.data().startIso)
+                 .filter(iso => iso.includes(checkDate))
+                 .map(iso => new Date(iso).toLocaleTimeString('en-US', { timeZone: 'UTC', hour: '2-digit', minute: '2-digit' }));
+
+               const freeHours = standardHours.filter(h => !bookedHours.includes(h));
+               if (freeHours.length === 0) slotReport.push(`• **${room.id}**: Fully booked. ❌`);
+               else slotReport.push(`• **${room.id}** (${freeHours.length} slots free):\n  ↳ [ ${freeHours.join(" | ")} ]`);
            }
-           return { success: true, text: `Here is the open slot availability for ${checkDate}:\n${slotReport.join("\n")}` };
+           return { success: true, text: `Here is the slot availability grid for **${checkDate}**:\n\n${slotReport.join("\n\n")}` };
         }
 
-        // Default 'Search' Intent
-        const namesList = topMatches.map(r => r.id).join(", ");
-        if (!startIso) return { success: true, text: `I found these great options: **${namesList}**. Would you like to check availability for a specific time?` };
+        const namesList = filteredRooms.map(r => r.id).join(", ");
+        if (!startIso) return { success: true, text: `I found these configurations matching your query: **${namesList}**.` };
 
-        // Real-time check
         const bookingsRef = collection(db, "bookings");
         let availableNames = [];
-        for (const room of topMatches) {
+        for (const room of filteredRooms) {
            const q = query(bookingsRef, where("roomId", "==", room.id), where("startIso", "==", startIso));
            const snapshot = await getDocs(q);
            if (snapshot.empty) availableNames.push(room.id);
         }
-
-        if (availableNames.length === 0) return { success: true, text: `The best matches (${namesList}) are all booked at that time.` };
-        return { success: true, text: `Good news! These are completely free right now: **${availableNames.join(", ")}**. Shall I lock one in?` };
+        if (availableNames.length === 0) return { success: true, text: `Those matching specifications are completely occupied at that slot.` };
+        return { success: true, text: `The following matches are open: **${availableNames.join(", ")}**.` };
       } 
       
-      // EVAL 18 FIX: Bulk Batch Processing Array
       else if (call.name === "bookRoom") {
         const { bookings } = call.args as any;
         let responseMessages = [];
         let finalBookedRoom = null;
 
-        // Loop through the AI's array and execute them one by one safely!
         for (const b of bookings) {
-          const roomData = ROOM_DIRECTORY.find(r => r.id === b.roomId);
-          if (!roomData) {
-            responseMessages.push(`❌ Room '${b.roomId}' does not exist.`);
-            continue;
-          }
-          const dbResult = await createBooking(b.roomId, b.professorName, b.startIso, b.endIso);
+          const roomData = ROOM_DIRECTORY.find(r => r.id.toLowerCase() === b.roomId.toLowerCase());
+          if (!roomData) { responseMessages.push(`❌ Room '${b.roomId}' does not exist.`); continue; }
+          
+          const dbResult = await createBooking(roomData.id, currentUser, b.startIso, b.endIso);
           if (dbResult.success) {
-            // Extract just the hour to make the success message readable
-            const readableTime = new Date(b.startIso).toLocaleTimeString('en-US', { timeZone: 'UTC', hour: '2-digit', minute:'2-digit' });            responseMessages.push(`✅ Locked in **${b.roomId}** for ${readableTime}.`);
-            finalBookedRoom = b.roomId; 
+            const readableTime = new Date(b.startIso).toLocaleTimeString('en-US', { timeZone: 'UTC', hour: '2-digit', minute:'2-digit' });
+            responseMessages.push(`✅ Locked in **${roomData.id}** at ${readableTime}.`);
+            finalBookedRoom = roomData.id; 
+          } else { responseMessages.push(`❌ Action block on ${roomData.id}: ${dbResult.error}`); }
+        }
+        return { success: true, refreshRoom: finalBookedRoom, text: responseMessages.join("\n") };
+      }
+
+      // UPGRADED: Loops over the cancellation array variables sequentially
+      else if (call.name === "cancelBooking") {
+        const { cancellations } = call.args as any;
+        let responseMessages = [];
+        let lastTargetRoom = null;
+
+        // Contextual execution fallback tracker
+        if (cancellations.length === 1 && !cancellations[0].roomId) {
+          const dbResult = await deleteBookingByDetails(null, null, currentUser);
+          if (dbResult.success) {
+            return { success: true, refreshRoom: dbResult.targetRoom, text: `✅ I have successfully wiped your most recent reservation booking container.` };
+          } else { return { success: false, error: `❌ ${dbResult.error}` }; }
+        }
+
+        for (const c of cancellations) {
+          const normalizedRoom = ROOM_DIRECTORY.find(r => r.id.toLowerCase() === c.roomId.toLowerCase());
+          const targetId = normalizedRoom ? normalizedRoom.id : c.roomId;
+
+          const dbResult = await deleteBookingByDetails(targetId, c.startIso, currentUser);
+          if (dbResult.success) {
+            const readableTime = new Date(c.startIso).toLocaleTimeString('en-US', { timeZone: 'UTC', hour: '2-digit', minute:'2-digit' });
+            responseMessages.push(`✅ Removed reservation block for **${targetId}** at ${readableTime}.`);
+            lastTargetRoom = targetId;
           } else {
-            responseMessages.push(`❌ Couldn't book ${b.roomId}: ${dbResult.error}`);
+            responseMessages.push(`❌ Dropping slot lock failed for ${targetId}: ${dbResult.error}`);
           }
         }
 
-        return { 
-          success: true, 
-          bookedRoom: finalBookedRoom, // Pass the last successfully booked room to update the UI
-          text: responseMessages.join("\n") 
-        };
+        return { success: true, refreshRoom: lastTargetRoom, text: responseMessages.join("\n") };
       }
     }
 

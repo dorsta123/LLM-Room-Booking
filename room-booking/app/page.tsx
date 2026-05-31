@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback } from "react";
-import { createBooking, getBookings, getAllBookings, deleteBookingById, getAiResponse } from "./actions";
+import { createBooking, getBookings, deleteBookingById, getAiResponse } from "./actions";
 
 const ALL_ROOMS = [
   "Study-1A", "Study-1B", "Study-2A", "Study-2B",
@@ -10,6 +10,15 @@ const ALL_ROOMS = [
   "CompLab-1", "BioLab-A", "ChemLab-B",
   "Lecture-Hall-A", "Lecture-Hall-B", "Auditorium-Main", "Auditorium-North",
 ];
+
+// Define a type for our dynamic day objects
+type DayData = {
+  name: string;
+  date: number;
+  month: number;
+  year: number;
+  fullDateStr: string;
+};
 
 export default function Home() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
@@ -24,18 +33,47 @@ export default function Home() {
     slotId?: string;
     fullDate?: string;
     time?: string;
-    date?: number;
+    displayDate?: string;
   } | null>(null);
 
   const [realBookings, setRealBookings] = useState<any[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [messages, setMessages] = useState<{ role: string; text: string }[]>([]);
+  
+  // Dynamic Date State
+  const [weekDays, setWeekDays] = useState<DayData[]>([]);
+  const [currentMonthDisplay, setCurrentMonthDisplay] = useState("");
 
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  // ---- Initialize Dynamic Calendar Dates ----
+  useEffect(() => {
+    const today = new Date();
+    // Find the Sunday of the current week
+    const startOfWeek = new Date(today);
+    startOfWeek.setDate(today.getDate() - today.getDay());
+
+    const days: DayData[] = Array.from({ length: 7 }).map((_, i) => {
+      const d = new Date(startOfWeek);
+      d.setDate(d.getDate() + i);
+      return {
+        name: d.toLocaleDateString("en-US", { weekday: "short" }),
+        date: d.getDate(),
+        month: d.getMonth() + 1,
+        year: d.getFullYear(),
+        fullDateStr: d.toLocaleDateString("en-US", { month: "long", day: "numeric" })
+      };
+    });
+
+    setWeekDays(days);
+    
+    // Set header based on the start of the week
+    setCurrentMonthDisplay(startOfWeek.toLocaleDateString("en-US", { month: "long", year: "numeric" }));
+  }, []);
 
   // ---- Load bookings for the selected room ----
   const loadRoomBookings = useCallback(async (roomId: string) => {
@@ -48,29 +86,16 @@ export default function Home() {
     loadRoomBookings(selectedRoom);
   }, [selectedRoom, isLoggedIn, loadRoomBookings]);
 
-  // ---- Calendar data ----
-  const weekDays = [
-    { name: "Sun", date: 24 },
-    { name: "Mon", date: 25 },
-    { name: "Tue", date: 26 },
-    { name: "Wed", date: 27 },
-    { name: "Thu", date: 28 },
-    { name: "Fri", date: 29 },
-    { name: "Sat", date: 30 },
-  ];
-
   const hours = [
     "09:00 AM","10:00 AM","11:00 AM","12:00 PM",
     "01:00 PM","02:00 PM","03:00 PM","04:00 PM","05:00 PM",
   ];
 
   /**
-   * Fixed ISO formatter.
-   * Handles the 12-hour edge cases correctly:
-   *   12:00 AM → 00:xx  (midnight)
-   *   12:00 PM → 12:xx  (noon) — was broken in original code
+   * Completely Dynamic ISO formatter.
+   * Pulls the exact year, month, and date from the clicked column's state.
    */
-  const formatIsoString = (date: number, timeStr: string): string => {
+  const formatIsoString = (dayObj: DayData, timeStr: string): string => {
     const [time, modifier] = timeStr.split(" ");
     let [h, m] = time.split(":");
     let hour = parseInt(h, 10);
@@ -81,9 +106,12 @@ export default function Home() {
       if (hour !== 12) hour += 12;     // 1–11 PM → 13–23; 12 PM stays 12
     }
 
-    const dayPad  = date < 10 ? `0${date}` : `${date}`;
+    const y = dayObj.year;
+    const mo = dayObj.month < 10 ? `0${dayObj.month}` : `${dayObj.month}`;
+    const d  = dayObj.date < 10 ? `0${dayObj.date}` : `${dayObj.date}`;
     const hourPad = hour < 10 ? `0${hour}` : `${hour}`;
-    return `2026-05-${dayPad}T${hourPad}:${m}:00.000Z`;
+    
+    return `${y}-${mo}-${d}T${hourPad}:${m}:00.000Z`;
   };
 
   // ---- Login ----
@@ -102,11 +130,17 @@ export default function Home() {
   };
 
   // ---- Calendar slot click ----
-  const handleSlotClick = (date: number, time: string, existingBooking: any) => {
-    const fullDate = formatIsoString(date, time);
+  const handleSlotClick = (dayObj: DayData, time: string, existingBooking: any) => {
+    const fullDate = formatIsoString(dayObj, time);
     if (existingBooking) {
       if (existingBooking.professorName === professorName) {
-        setPendingAction({ type: "cancel", slotId: existingBooking.id, time, date, fullDate });
+        setPendingAction({ 
+          type: "cancel", 
+          slotId: existingBooking.id, 
+          time, 
+          displayDate: dayObj.fullDateStr, 
+          fullDate 
+        });
       } else {
         setMessages(prev => [
           ...prev,
@@ -114,7 +148,7 @@ export default function Home() {
         ]);
       }
     } else {
-      setPendingAction({ type: "book", time, date, fullDate });
+      setPendingAction({ type: "book", time, displayDate: dayObj.fullDateStr, fullDate });
     }
   };
 
@@ -158,7 +192,6 @@ export default function Home() {
 
     try {
       setMessages(prev => [...prev, { role: "system", text: "Thinking..." }]);
-
       const aiResult = await getAiResponse(newHistory, selectedRoom, professorName);
 
       setMessages(prev => {
@@ -171,10 +204,7 @@ export default function Home() {
 
       if (aiResult.success) {
         const r = aiResult as any;
-
         if (r.refreshAll) {
-          // Batch operation touched multiple rooms — reload whichever is visible
-          // plus switch to the last affected room if known
           if (r.refreshRoom && r.refreshRoom !== selectedRoom) {
             setSelectedRoom(r.refreshRoom);
           } else {
@@ -182,12 +212,11 @@ export default function Home() {
           }
         } else if (r.refreshRoom) {
           if (r.refreshRoom !== selectedRoom) {
-            setSelectedRoom(r.refreshRoom); // triggers useEffect reload
+            setSelectedRoom(r.refreshRoom); 
           } else {
             await loadRoomBookings(selectedRoom);
           }
         } else {
-          // No specific room change, still refresh view in case AI read data
           await loadRoomBookings(selectedRoom);
         }
       }
@@ -201,27 +230,18 @@ export default function Home() {
     }
   };
 
-  // ==========================================
-  // RENDER — Login
-  // ==========================================
   if (!isLoggedIn) {
     return (
       <main className="h-screen flex items-center justify-center bg-gray-50 font-sans p-4">
         <div className="max-w-md w-full bg-white rounded-2xl shadow-xl border border-gray-100 p-8 space-y-6 animate-in fade-in zoom-in duration-300">
           <div className="text-center space-y-2">
-            <div className="w-12 h-12 bg-blue-100 text-blue-600 rounded-full flex items-center justify-center mx-auto text-2xl mb-4">
-              🎓
-            </div>
+            <div className="w-12 h-12 bg-blue-100 text-blue-600 rounded-full flex items-center justify-center mx-auto text-2xl mb-4">🎓</div>
             <h1 className="text-2xl font-bold text-gray-900">University Portal</h1>
-            <p className="text-gray-500 text-sm">
-              Please identify yourself to access the AI booking system.
-            </p>
+            <p className="text-gray-500 text-sm">Please identify yourself to access the AI booking system.</p>
           </div>
           <form onSubmit={handleLogin} className="space-y-4">
             <div>
-              <label htmlFor="name" className="block text-sm font-medium text-gray-700 mb-1">
-                Full Name / Title
-              </label>
+              <label htmlFor="name" className="block text-sm font-medium text-gray-700 mb-1">Full Name / Title</label>
               <input
                 id="name"
                 type="text"
@@ -233,10 +253,7 @@ export default function Home() {
                 className="w-full border border-gray-300 rounded-lg px-4 py-3 text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-gray-50 transition-all"
               />
             </div>
-            <button
-              type="submit"
-              className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 rounded-lg transition-colors shadow-md hover:shadow-lg"
-            >
+            <button type="submit" className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 rounded-lg transition-colors shadow-md hover:shadow-lg">
               Secure Login
             </button>
           </form>
@@ -245,71 +262,28 @@ export default function Home() {
     );
   }
 
-  // ==========================================
-  // RENDER — Main App
-  // ==========================================
   return (
     <main className="h-screen flex flex-col bg-gray-50 font-sans">
-
       {/* ---- Confirm Modal ---- */}
       {pendingAction && (
         <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4 backdrop-blur-sm animate-in fade-in duration-300">
-          <div
-            className={`max-w-md w-full rounded-2xl shadow-2xl border p-8 space-y-6 animate-in zoom-in-95 duration-300 ${
-              pendingAction.type === "book"
-                ? "bg-blue-50 border-blue-100"
-                : "bg-red-50 border-red-100"
-            }`}
-          >
+          <div className={`max-w-md w-full rounded-2xl shadow-2xl border p-8 space-y-6 animate-in zoom-in-95 duration-300 ${pendingAction.type === "book" ? "bg-blue-50 border-blue-100" : "bg-red-50 border-red-100"}`}>
             <div className="text-center space-y-3">
-              <div
-                className={`w-16 h-16 rounded-full flex items-center justify-center mx-auto text-4xl mb-6 shadow-md ${
-                  pendingAction.type === "book"
-                    ? "bg-blue-100 text-blue-600"
-                    : "bg-red-100 text-red-600"
-                }`}
-              >
+              <div className={`w-16 h-16 rounded-full flex items-center justify-center mx-auto text-4xl mb-6 shadow-md ${pendingAction.type === "book" ? "bg-blue-100 text-blue-600" : "bg-red-100 text-red-600"}`}>
                 {pendingAction.type === "book" ? "✅" : "🗑️"}
               </div>
-              <h2
-                className={`text-3xl font-extrabold ${
-                  pendingAction.type === "book" ? "text-blue-950" : "text-red-950"
-                }`}
-              >
+              <h2 className={`text-3xl font-extrabold ${pendingAction.type === "book" ? "text-blue-950" : "text-red-950"}`}>
                 {pendingAction.type === "book" ? "Confirm Booking" : "Confirm Deletion"}
               </h2>
-              <p
-                className={`text-base font-medium leading-relaxed ${
-                  pendingAction.type === "book" ? "text-blue-900" : "text-red-900"
-                }`}
-              >
-                You are about to{" "}
-                {pendingAction.type === "book" ? "reserve" : "cancel the reservation for"}
-                <span className="block mt-1 font-extrabold text-xl">
-                  <strong>{selectedRoom}</strong>
-                </span>
-                on <span className="font-extrabold">May {pendingAction.date}</span> at{" "}
-                <span className="font-extrabold">{pendingAction.time}</span>.
+              <p className={`text-base font-medium leading-relaxed ${pendingAction.type === "book" ? "text-blue-900" : "text-red-900"}`}>
+                You are about to {pendingAction.type === "book" ? "reserve" : "cancel the reservation for"}
+                <span className="block mt-1 font-extrabold text-xl"><strong>{selectedRoom}</strong></span>
+                on <span className="font-extrabold">{pendingAction.displayDate}</span> at <span className="font-extrabold">{pendingAction.time}</span>.
               </p>
             </div>
             <div className="flex gap-4 pt-4">
-              <button
-                onClick={() => setPendingAction(null)}
-                className="flex-1 px-6 py-4 text-base font-semibold text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-xl transition-colors shadow-sm"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={executePendingAction}
-                disabled={isLoading}
-                className={`flex-1 px-6 py-4 text-base font-bold text-white rounded-xl transition-all shadow-md hover:shadow-lg ${
-                  isLoading
-                    ? "bg-gray-400 cursor-not-allowed"
-                    : pendingAction.type === "book"
-                    ? "bg-blue-600 hover:bg-blue-700"
-                    : "bg-red-600 hover:bg-red-700"
-                }`}
-              >
+              <button onClick={() => setPendingAction(null)} className="flex-1 px-6 py-4 text-base font-semibold text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-xl transition-colors shadow-sm">Cancel</button>
+              <button onClick={executePendingAction} disabled={isLoading} className={`flex-1 px-6 py-4 text-base font-bold text-white rounded-xl transition-all shadow-md hover:shadow-lg ${isLoading ? "bg-gray-400 cursor-not-allowed" : pendingAction.type === "book" ? "bg-blue-600 hover:bg-blue-700" : "bg-red-600 hover:bg-red-700"}`}>
                 {isLoading ? "Processing..." : pendingAction.type === "book" ? "Book Room" : "Delete Booking"}
               </button>
             </div>
@@ -320,11 +294,9 @@ export default function Home() {
       {/* ---- Calendar Panel ---- */}
       <div className="flex-1 flex flex-col overflow-hidden p-4 sm:p-6">
         <div className="max-w-6xl mx-auto w-full h-full flex flex-col bg-white rounded-xl shadow-sm border border-gray-200 animate-in fade-in slide-in-from-bottom-4 duration-500 relative">
-
-          {/* Header */}
           <div className="flex justify-between items-center p-4 border-b border-gray-200 bg-white">
             <div>
-              <h1 className="text-xl font-bold text-gray-900">May 2026</h1>
+              <h1 className="text-xl font-bold text-gray-900">{currentMonthDisplay}</h1>
               <p className="text-sm text-gray-500">Live Database View</p>
             </div>
             <div className="flex items-center gap-4">
@@ -332,94 +304,54 @@ export default function Home() {
                 <span className="w-2 h-2 rounded-full bg-green-500"></span>
                 <span className="text-sm font-semibold text-gray-700">{professorName}</span>
               </div>
-              <select
-                value={selectedRoom}
-                onChange={e => setSelectedRoom(e.target.value)}
-                className="border border-gray-300 rounded-lg p-2 text-black bg-gray-50 focus:ring-2 focus:ring-blue-500 outline-none text-sm font-medium shadow-sm hover:border-gray-400 cursor-pointer transition-all"
-              >
-                {ALL_ROOMS.map(room => (
-                  <option key={room} value={room}>{room}</option>
-                ))}
+              <select value={selectedRoom} onChange={e => setSelectedRoom(e.target.value)} className="border border-gray-300 rounded-lg p-2 text-black bg-gray-50 focus:ring-2 focus:ring-blue-500 outline-none text-sm font-medium shadow-sm hover:border-gray-400 cursor-pointer transition-all">
+                {ALL_ROOMS.map(room => <option key={room} value={room}>{room}</option>)}
               </select>
             </div>
           </div>
 
-          {/* Grid */}
           <div className="flex-1 overflow-y-auto relative bg-white">
             <div className="min-w-[700px]">
-
-              {/* Day headers */}
               <div className="sticky top-0 z-10 bg-white grid grid-cols-8 border-b border-gray-200 shadow-sm">
                 <div className="col-span-1 p-3" />
                 {weekDays.map(day => (
-                  <div key={day.date} className="col-span-1 p-3 text-center border-l border-gray-100">
+                  <div key={`${day.month}-${day.date}`} className="col-span-1 p-3 text-center border-l border-gray-100">
                     <div className="text-xs font-semibold text-gray-500 uppercase">{day.name}</div>
-                    <div
-                      className={`text-xl mt-1 ${
-                        day.date === 25 ? "text-blue-600 font-bold" : "text-gray-900"
-                      }`}
-                    >
-                      {day.date}
-                    </div>
+                    <div className={`text-xl mt-1 text-gray-900`}>{day.date}</div>
                   </div>
                 ))}
               </div>
 
-              {/* Time rows */}
               <div className="grid grid-cols-8 relative">
                 <div className="col-span-1 border-r border-gray-200 bg-white">
                   {hours.map(hour => (
-                    <div
-                      key={hour}
-                      className="h-16 text-right pr-3 pt-2 text-xs text-gray-400 font-medium border-b border-gray-100"
-                    >
-                      {hour}
-                    </div>
+                    <div key={hour} className="h-16 text-right pr-3 pt-2 text-xs text-gray-400 font-medium border-b border-gray-100">{hour}</div>
                   ))}
                 </div>
 
                 <div className="col-span-7 grid grid-cols-7 relative">
                   {weekDays.map(day => (
-                    <div key={`col-${day.date}`} className="col-span-1 border-r border-gray-100">
+                    <div key={`col-${day.month}-${day.date}`} className="col-span-1 border-r border-gray-100">
                       {hours.map(hour => {
-                        const cellIso = formatIsoString(day.date, hour);
+                        const cellIso = formatIsoString(day, hour);
                         const existingBooking = realBookings.find(b => {
                           if (!b.startTime) return false;
                           return new Date(b.startTime).getTime() === new Date(cellIso).getTime();
                         });
-                        const isSelected =
-                          pendingAction?.date === day.date && pendingAction?.time === hour;
+                        const isSelected = pendingAction?.fullDate === cellIso;
 
                         return (
                           <div
-                            key={`${day.date}-${hour}`}
-                            onClick={() => handleSlotClick(day.date, hour, existingBooking)}
+                            key={`${day.month}-${day.date}-${hour}`}
+                            onClick={() => handleSlotClick(day, hour, existingBooking)}
                             className={`h-16 border-b border-gray-100 relative transition-all
-                              ${
-                                existingBooking
-                                  ? existingBooking.professorName === professorName
-                                    ? "cursor-pointer bg-blue-50 hover:bg-blue-100"
-                                    : "cursor-not-allowed bg-red-50/80"
-                                  : "cursor-pointer hover:bg-blue-50"
-                              }
+                              ${existingBooking ? existingBooking.professorName === professorName ? "cursor-pointer bg-blue-50 hover:bg-blue-100" : "cursor-not-allowed bg-red-50/80" : "cursor-pointer hover:bg-blue-50"}
                               ${isSelected ? "ring-2 ring-inset ring-blue-500" : ""}`}
                           >
                             {existingBooking && (
-                              <div
-                                className={`absolute inset-0.5 rounded p-1.5 overflow-hidden flex flex-col justify-start z-0 ${
-                                  existingBooking.professorName === professorName
-                                    ? "bg-blue-100 border border-blue-200 text-blue-900"
-                                    : "bg-red-100 border border-red-200 text-red-900"
-                                }`}
-                              >
-                                <span className="font-bold text-xs truncate">
-                                  {existingBooking.professorName}
-                                </span>
-                                <span className="text-[10px] font-medium opacity-75 truncate">
-                                  {existingBooking.professorName === professorName
-                                    ? "Your Booking"
-                                    : "Unavailable"}
-                                </span>
+                              <div className={`absolute inset-0.5 rounded p-1.5 overflow-hidden flex flex-col justify-start z-0 ${existingBooking.professorName === professorName ? "bg-blue-100 border border-blue-200 text-blue-900" : "bg-red-100 border border-red-200 text-red-900"}`}>
+                                <span className="font-bold text-xs truncate">{existingBooking.professorName}</span>
+                                <span className="text-[10px] font-medium opacity-75 truncate">{existingBooking.professorName === professorName ? "Your Booking" : "Unavailable"}</span>
                               </div>
                             )}
                           </div>
@@ -440,25 +372,14 @@ export default function Home() {
           <div className="max-w-6xl mx-auto w-full space-y-4">
             {messages.map((msg, idx) => (
               <div key={idx} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
-                <div
-                  className={`px-4 py-3 rounded-2xl max-w-[85%] sm:max-w-[70%] text-sm sm:text-base whitespace-pre-wrap ${
-                    msg.role === "user"
-                      ? "bg-blue-600 text-white rounded-br-sm shadow-md"
-                      : "bg-white border border-gray-200 text-gray-800 rounded-bl-sm shadow-sm font-medium leading-relaxed"
-                  }`}
-                >
-                  <span
-                    dangerouslySetInnerHTML={{
-                      __html: msg.text.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>"),
-                    }}
-                  />
+                <div className={`px-4 py-3 rounded-2xl max-w-[85%] sm:max-w-[70%] text-sm sm:text-base whitespace-pre-wrap ${msg.role === "user" ? "bg-blue-600 text-white rounded-br-sm shadow-md" : "bg-white border border-gray-200 text-gray-800 rounded-bl-sm shadow-sm font-medium leading-relaxed"}`}>
+                  <span dangerouslySetInnerHTML={{ __html: msg.text.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>") }} />
                 </div>
               </div>
             ))}
             <div ref={chatEndRef} />
           </div>
         </div>
-
         <div className="p-4 bg-white border-t border-gray-100 z-10">
           <form onSubmit={handleSendMessage} className="max-w-6xl mx-auto w-full flex gap-2 sm:gap-3">
             <input
@@ -469,15 +390,7 @@ export default function Home() {
               placeholder="Ask your AI assistant..."
               className="flex-1 border border-gray-300 rounded-full px-6 py-3.5 text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-gray-50 text-sm sm:text-base disabled:bg-gray-100 transition-all shadow-inner"
             />
-            <button
-              type="submit"
-              disabled={isLoading}
-              className={`text-white px-8 py-3.5 rounded-full font-semibold transition-all text-sm sm:text-base shadow-md ${
-                isLoading
-                  ? "bg-gray-400 cursor-not-allowed"
-                  : "bg-blue-600 hover:bg-blue-700 hover:shadow-lg hover:-translate-y-0.5"
-              }`}
-            >
+            <button type="submit" disabled={isLoading} className={`text-white px-8 py-3.5 rounded-full font-semibold transition-all text-sm sm:text-base shadow-md ${isLoading ? "bg-gray-400 cursor-not-allowed" : "bg-blue-600 hover:bg-blue-700 hover:shadow-lg hover:-translate-y-0.5"}`}>
               {isLoading ? "Sending..." : "Send"}
             </button>
           </form>

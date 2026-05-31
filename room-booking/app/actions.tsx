@@ -41,12 +41,11 @@ const OPERATING_HOURS_END   = 17; // 17:00 UTC (last slot starts at 17:00, ends 
 // ==========================================
 function isWithinOperatingHours(isoString: string): boolean {
   const hour = new Date(isoString).getUTCHours();
-  // Bookable start hours: 09–17 inclusive (last session 17:00–18:00 is the edge; anything >= 18 is out)
   return hour >= OPERATING_HOURS_START && hour <= OPERATING_HOURS_END;
 }
 
 function buildDynamicTemporalAnchor(): string {
-  // Always relative to actual server date so tests don't rot
+  // Always relative to exact real-world server execution time
   const now = new Date();
   const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
   const todayDow = now.getUTCDay();
@@ -55,12 +54,16 @@ function buildDynamicTemporalAnchor(): string {
   const todayYear = now.getUTCFullYear();
   const monthName = now.toLocaleString("en-US", { month: "long", timeZone: "UTC" });
 
-  // Build week mapping (Sun through Sat of the current week)
-  const lines: string[] = [`Today is ${dayNames[todayDow]}, ${monthName} ${todayDate}, ${todayYear}.`, "Week mapping:"];
+  const lines: string[] = [`Today is ${dayNames[todayDow]}, ${monthName} ${todayDate}, ${todayYear}.`, "Week mapping (UI displays this exact week):"];
+  
+  // Calculate the Sunday of the current week (matches UI logic perfectly)
+  const startOfWeek = new Date(Date.UTC(todayYear, todayMonth - 1, todayDate - todayDow));
+  
   for (let d = 0; d < 7; d++) {
-    const delta = d - todayDow;
-    const mapped = new Date(Date.UTC(todayYear, todayMonth - 1, todayDate + delta));
-    lines.push(`  ${dayNames[d]} = ${monthName} ${mapped.getUTCDate()}`);
+    const mapped = new Date(startOfWeek);
+    mapped.setUTCDate(startOfWeek.getUTCDate() + d);
+    const mName = mapped.toLocaleString("en-US", { month: "long", timeZone: "UTC" });
+    lines.push(`  ${dayNames[d]} = ${mName} ${mapped.getUTCDate()}, ${mapped.getUTCFullYear()}`);
   }
   lines.push(`Operating hours: 09:00–17:00 UTC. Bookings outside this range are FORBIDDEN.`);
   return lines.join("\n");
@@ -119,7 +122,6 @@ export async function getBookings(roomId: string) {
   }
 }
 
-/** Fetch ALL bookings across all rooms (for analytics + "who's in room X" queries). */
 export async function getAllBookings() {
   try {
     const bookingsRef = collection(db, "bookings");
@@ -131,7 +133,6 @@ export async function getAllBookings() {
   }
 }
 
-/** Fetch all bookings belonging to a specific professor (cross-room). */
 export async function getAllBookingsByProfessor(professorName: string) {
   try {
     const bookingsRef = collection(db, "bookings");
@@ -154,14 +155,6 @@ export async function deleteBookingById(bookingId: string) {
   }
 }
 
-/**
- * Delete by details. Supports three modes — all use a single-field where clause
- * then filter in memory to avoid composite index requirements.
- *
- *  1. roomId + startIso + professorName → fetch by roomId, match startIso + professorName in memory
- *  2. roomId=null + startIso + professorName → fetch all professor bookings, match startIso in memory
- *  3. roomId=null + startIso=null + professorName → fetch all professor bookings, pick most recent by createdAt
- */
 export async function deleteBookingByDetails(
   roomId: string | null,
   startIso: string | null,
@@ -171,7 +164,6 @@ export async function deleteBookingByDetails(
     const bookingsRef = collection(db, "bookings");
 
     if (roomId) {
-      // Mode 1: fetch by roomId (single field), filter by startIso + professorName in memory
       const q = query(bookingsRef, where("roomId", "==", roomId));
       const snapshot = await getDocs(q);
       const match = snapshot.docs.find(d => {
@@ -184,13 +176,11 @@ export async function deleteBookingByDetails(
       return { success: true, targetRoom: roomId };
     }
 
-    // Modes 2 & 3: fetch all professor bookings with single-field where, no composite index needed
     const q = query(bookingsRef, where("professorName", "==", professorName));
     const snapshot = await getDocs(q);
     if (snapshot.empty) return { success: false, error: "No active bookings registered to your name." };
 
     if (startIso) {
-      // Mode 2: match by startIso in memory
       const match = snapshot.docs.find(d => d.data().startIso === startIso);
       if (!match) return { success: false, error: "You have no booking at that time slot." };
       const targetRoom = match.data().roomId;
@@ -199,7 +189,6 @@ export async function deleteBookingByDetails(
       return { success: true, targetRoom };
     }
 
-    // Mode 3: pick the most recent by createdAt, sorted in memory
     const sorted = snapshot.docs.sort(
       (a, b) => new Date(b.data().createdAt).getTime() - new Date(a.data().createdAt).getTime()
     );
@@ -213,7 +202,6 @@ export async function deleteBookingByDetails(
   }
 }
 
-/** Delete ALL bookings for a professor across all rooms. Returns list of deleted room IDs. */
 export async function deleteAllBookingsByProfessor(professorName: string) {
   try {
     const bookingsRef = collection(db, "bookings");
@@ -246,8 +234,6 @@ export async function getAiResponse(
       project: process.env.GOOGLE_CLOUD_PROJECT as string,
       location: "us-central1",
     });
-
-    // ---- Tool declarations ----
 
     const checkAvailabilityTool: FunctionDeclaration = {
       name: "checkAvailability",
@@ -330,7 +316,6 @@ export async function getAiResponse(
       },
     };
 
-    // ---- System prompt ----
     const temporalAnchor = buildDynamicTemporalAnchor();
 
     const systemPrompt = `You are an elite university room booking agent for ${currentUser}.
@@ -371,8 +356,6 @@ VALID ROOM IDs: ${VALID_ROOM_NAMES}`;
     const response = result.response;
     const call = response.candidates?.[0]?.content?.parts?.find(p => p.functionCall)?.functionCall;
 
-    // ---- Tool execution ----
-
     if (call?.name === "checkAvailability") {
       const {
         intent,
@@ -389,7 +372,6 @@ VALID ROOM IDs: ${VALID_ROOM_NAMES}`;
         floor = null,
       } = call.args as any;
 
-      // Floor existence guard
       if (floor !== null && floor !== undefined && !VALID_FLOORS.includes(floor)) {
         return { success: true, text: `⚠️ Floor **${floor}** does not exist in this building. Valid floors are: ${VALID_FLOORS.join(", ")}.` };
       }
@@ -407,7 +389,6 @@ VALID ROOM IDs: ${VALID_ROOM_NAMES}`;
         return true;
       });
 
-      // --- intent: info ---
       if (intent === "info") {
         if (filteredRooms.length === 0) return { success: true, text: "No rooms match those specifications." };
         const lines = filteredRooms.map(
@@ -416,18 +397,16 @@ VALID ROOM IDs: ${VALID_ROOM_NAMES}`;
         return { success: true, text: `Room specifications:\n\n${lines.join("\n")}` };
       }
 
-      // --- intent: count ---
       if (intent === "count") {
         return { success: true, text: `There are **${filteredRooms.length}** rooms matching that criteria.` };
       }
 
-      // --- intent: slots (free slots for up to 20 rooms on a date) ---
       if (intent === "slots" && checkDate) {
         const bookingsRef = collection(db, "bookings");
         const standardHours = ["09:00 AM","10:00 AM","11:00 AM","12:00 PM","01:00 PM","02:00 PM","03:00 PM","04:00 PM","05:00 PM"];
         const slotReport: string[] = [];
 
-        for (const room of filteredRooms) {  // No artificial cap — all matching rooms
+        for (const room of filteredRooms) { 
           const q = query(bookingsRef, where("roomId", "==", room.id));
           const snapshot = await getDocs(q);
           const bookedHours = snapshot.docs
@@ -445,7 +424,6 @@ VALID ROOM IDs: ${VALID_ROOM_NAMES}`;
         return { success: true, text: `Slot availability for **${checkDate}**:\n\n${slotReport.join("\n\n")}` };
       }
 
-      // --- intent: all_day_free (rooms with ALL 9 slots open) ---
       if (intent === "all_day_free" && checkDate) {
         const bookingsRef = collection(db, "bookings");
         const freeAllDay: string[] = [];
@@ -465,7 +443,6 @@ VALID ROOM IDs: ${VALID_ROOM_NAMES}`;
         };
       }
 
-      // --- intent: bookings_for_room (who is using a room on a date) ---
       if (intent === "bookings_for_room" && roomId) {
         const targetRoom = ROOM_DIRECTORY.find(r => r.id.toLowerCase() === roomId.toLowerCase());
         if (!targetRoom) return { success: true, text: `Room **${roomId}** not found in directory.` };
@@ -492,7 +469,6 @@ VALID ROOM IDs: ${VALID_ROOM_NAMES}`;
         };
       }
 
-      // --- intent: professor_bookings (analytics for current user) ---
       if (intent === "professor_bookings") {
         const result = await getAllBookingsByProfessor(currentUser);
         if (!result.success || (result.data as any[]).length === 0)
@@ -509,14 +485,12 @@ VALID ROOM IDs: ${VALID_ROOM_NAMES}`;
         };
       }
 
-      // --- intent: search (find available rooms matching filters at a specific time) ---
       if (!startIso) {
         const names = filteredRooms.map(r => r.id).join(", ");
         if (!names) return { success: true, text: "No rooms match those specifications." };
         return { success: true, text: `Rooms matching your criteria: **${names}**.` };
       }
 
-      // startIso provided — live availability check
       const bookingsRef = collection(db, "bookings");
       const available: string[] = [];
       for (const room of filteredRooms) {
@@ -529,14 +503,12 @@ VALID ROOM IDs: ${VALID_ROOM_NAMES}`;
       return { success: true, text: `Available rooms:\n\n${available.join("\n")}` };
     }
 
-    // ---- bookRoom ----
     else if (call?.name === "bookRoom") {
       const { bookings } = call.args as any;
       const messages: string[] = [];
       let lastBookedRoom: string | null = null;
 
       for (const b of bookings) {
-        // Operating hours guard (belt-and-suspenders even though AI is instructed)
         if (!isWithinOperatingHours(b.startIso)) {
           messages.push(`❌ **${b.roomId}** at ${new Date(b.startIso).getUTCHours()}:00 — outside operating hours (09:00–17:00).`);
           continue;
@@ -566,13 +538,11 @@ VALID ROOM IDs: ${VALID_ROOM_NAMES}`;
       };
     }
 
-    // ---- cancelBooking ----
     else if (call?.name === "cancelBooking") {
       const { cancellations, cancelAll = false } = call.args as any;
       const messages: string[] = [];
       let lastTargetRoom: string | null = null;
 
-      // Cancel ALL bookings for this professor
       if (cancelAll) {
         const result = await deleteAllBookingsByProfessor(currentUser);
         if (result.success) {
@@ -587,7 +557,6 @@ VALID ROOM IDs: ${VALID_ROOM_NAMES}`;
         }
       }
 
-      // Empty array → cancel most recent
       if (!cancellations || cancellations.length === 0) {
         const result = await deleteBookingByDetails(null, null, currentUser);
         if (result.success) {
@@ -597,9 +566,7 @@ VALID ROOM IDs: ${VALID_ROOM_NAMES}`;
         }
       }
 
-      // Specific cancellations
       for (const c of cancellations) {
-        // Identity check: only current user's bookings (extra safety — deleteBookingByDetails enforces professorName)
         const normalizedRoom = c.roomId
           ? ROOM_DIRECTORY.find(r => r.id.toLowerCase() === c.roomId.toLowerCase())
           : null;
@@ -625,7 +592,6 @@ VALID ROOM IDs: ${VALID_ROOM_NAMES}`;
       };
     }
 
-    // ---- Plain text response ----
     const textResponse =
       response.candidates?.[0]?.content?.parts?.[0]?.text ?? "I didn't quite catch that.";
     return { success: true, text: textResponse };
